@@ -425,7 +425,8 @@ export class Market {
     cacheDurationMs = 0,
   ) {
     if (!accounts.openOrdersAccount && !accounts.openOrdersAddressKey) {
-      const ownerAddress: PublicKey = accounts.owner.publicKey ?? accounts.owner;
+      const ownerAddress: PublicKey =
+        accounts.owner.publicKey ?? accounts.owner;
       const openOrdersAccounts = await this.findOpenOrdersAccountsForOwner(
         connection,
         ownerAddress,
@@ -435,7 +436,9 @@ export class Market {
     }
 
     const transaction = new Transaction();
-    transaction.add(this.makeReplaceOrdersByClientIdsInstruction(accounts, orders));
+    transaction.add(
+      this.makeReplaceOrdersByClientIdsInstruction(accounts, orders),
+    );
     return await this._sendTransaction(connection, transaction, [
       accounts.owner,
     ]);
@@ -761,6 +764,173 @@ export class Market {
     return { transaction, signers, payer: owner };
   }
 
+  async makePlaceOrderTransactions<T extends PublicKey | Account>(
+    connection: Connection,
+    {
+      owner,
+      payer,
+      side,
+      price,
+      size,
+      orderType = 'limit',
+      clientId,
+      openOrdersAddressKey,
+      openOrdersAccount,
+      feeDiscountPubkey = undefined,
+      selfTradeBehavior = 'decrementTake',
+      maxTs,
+      replaceIfExists = false,
+    }: OrderParams<T>,
+    cacheDurationMs = 0,
+    feeDiscountPubkeyCacheDurationMs = 0,
+  ) {
+    // @ts-ignore
+    const ownerAddress: PublicKey = owner.publicKey ?? owner;
+    const openOrdersAccounts = await this.findOpenOrdersAccountsForOwner(
+      connection,
+      ownerAddress,
+      cacheDurationMs,
+    );
+    const initTransaction = new Transaction();
+    const initSigners: Account[] = [];
+    const placeOrderTransaction = new Transaction();
+    const closeTransaction = new Transaction();
+
+    // Fetch an SRM fee discount key if the market supports discounts and it is not supplied
+    let useFeeDiscountPubkey: PublicKey | null;
+    if (feeDiscountPubkey) {
+      useFeeDiscountPubkey = feeDiscountPubkey;
+    } else if (
+      feeDiscountPubkey === undefined &&
+      this.supportsSrmFeeDiscounts
+    ) {
+      useFeeDiscountPubkey = (
+        await this.findBestFeeDiscountKey(
+          connection,
+          ownerAddress,
+          feeDiscountPubkeyCacheDurationMs,
+        )
+      ).pubkey;
+    } else {
+      useFeeDiscountPubkey = null;
+    }
+
+    let openOrdersAddress: PublicKey;
+    if (openOrdersAccounts.length === 0) {
+      let account;
+      if (openOrdersAccount) {
+        account = openOrdersAccount;
+      } else {
+        account = new Account();
+      }
+      initTransaction.add(
+        await OpenOrders.makeCreateAccountTransaction(
+          connection,
+          this.address,
+          ownerAddress,
+          account.publicKey,
+          this._programId,
+        ),
+      );
+      openOrdersAddress = account.publicKey;
+      initSigners.push(account);
+      // refresh the cache of open order accounts on next fetch
+      this._openOrdersAccountsCache[ownerAddress.toBase58()].ts = 0;
+    } else if (openOrdersAccount) {
+      openOrdersAddress = openOrdersAccount.publicKey;
+    } else if (openOrdersAddressKey) {
+      openOrdersAddress = openOrdersAddressKey;
+    } else {
+      openOrdersAddress = openOrdersAccounts[0].address;
+    }
+
+    let wrappedSolAccount: Account | null = null;
+    if (payer.equals(ownerAddress)) {
+      if (
+        (side === 'buy' && this.quoteMintAddress.equals(WRAPPED_SOL_MINT)) ||
+        (side === 'sell' && this.baseMintAddress.equals(WRAPPED_SOL_MINT))
+      ) {
+        wrappedSolAccount = new Account();
+        let lamports;
+        if (side === 'buy') {
+          lamports = Math.round(price * size * 1.01 * LAMPORTS_PER_SOL);
+          if (openOrdersAccounts.length > 0) {
+            lamports -= openOrdersAccounts[0].quoteTokenFree.toNumber();
+          }
+        } else {
+          lamports = Math.round(size * LAMPORTS_PER_SOL);
+          if (openOrdersAccounts.length > 0) {
+            lamports -= openOrdersAccounts[0].baseTokenFree.toNumber();
+          }
+        }
+        lamports = Math.max(lamports, 0) + 1e7;
+        initTransaction.add(
+          SystemProgram.createAccount({
+            fromPubkey: ownerAddress,
+            newAccountPubkey: wrappedSolAccount.publicKey,
+            lamports,
+            space: 165,
+            programId: TOKEN_PROGRAM_ID,
+          }),
+        );
+        initTransaction.add(
+          initializeAccount({
+            account: wrappedSolAccount.publicKey,
+            mint: WRAPPED_SOL_MINT,
+            owner: ownerAddress,
+          }),
+        );
+        initSigners.push(wrappedSolAccount);
+      } else {
+        throw new Error('Invalid payer account');
+      }
+    }
+
+    const placeOrderInstruction = this.makePlaceOrderInstruction(connection, {
+      owner,
+      payer: wrappedSolAccount?.publicKey ?? payer,
+      side,
+      price,
+      size,
+      orderType,
+      clientId,
+      openOrdersAddressKey: openOrdersAddress,
+      feeDiscountPubkey: useFeeDiscountPubkey,
+      selfTradeBehavior,
+      maxTs,
+      replaceIfExists,
+    });
+    placeOrderTransaction.add(placeOrderInstruction);
+
+    if (wrappedSolAccount) {
+      closeTransaction.add(
+        closeAccount({
+          source: wrappedSolAccount.publicKey,
+          destination: ownerAddress,
+          owner: ownerAddress,
+        }),
+      );
+    }
+
+    const transactions: {
+      transaction: Transaction;
+      signers?: Account[];
+    }[] = [
+      {
+        transaction: initTransaction,
+        signers: initSigners,
+      },
+      {
+        transaction: placeOrderTransaction,
+      },
+      {
+        transaction: closeTransaction,
+      },
+    ].filter((tx) => tx.transaction.instructions.length);
+
+    return { transactions, payer: owner };
+  }
+
   makePlaceOrderInstruction<T extends PublicKey | Account>(
     connection: Connection,
     params: OrderParams<T>,
@@ -867,7 +1037,8 @@ export class Market {
   }
 
   makeReplaceOrdersByClientIdsInstruction<T extends PublicKey | Account>(
-    accounts: OrderParamsAccounts<T>, orders: OrderParamsBase<T>[],
+    accounts: OrderParamsAccounts<T>,
+    orders: OrderParamsBase<T>[],
   ): TransactionInstruction {
     // @ts-ignore
     const ownerAddress: PublicKey = accounts.owner.publicKey ?? accounts.owner;
@@ -889,12 +1060,14 @@ export class Market {
       feeDiscountPubkey: this.supportsSrmFeeDiscounts
         ? accounts.feeDiscountPubkey
         : null,
-      orders: orders.map(order => ({
+      orders: orders.map((order) => ({
         side: order.side,
         limitPrice: this.priceNumberToLots(order.price),
         maxBaseQuantity: this.baseSizeNumberToLots(order.size),
         maxQuoteQuantity: new BN(this._decoded.quoteLotSize.toNumber()).mul(
-          this.baseSizeNumberToLots(order.size).mul(this.priceNumberToLots(order.price)),
+          this.baseSizeNumberToLots(order.size).mul(
+            this.priceNumberToLots(order.price),
+          ),
         ),
         orderType: order.orderType,
         clientId: order.clientId,
@@ -902,7 +1075,7 @@ export class Market {
         selfTradeBehavior: order.selfTradeBehavior,
         // @ts-ignore
         maxTs: order.maxTs,
-      }))
+      })),
     });
   }
 
@@ -1181,7 +1354,7 @@ export class Market {
             : quoteWallet,
         vaultSigner,
         programId: this._programId,
-        referrerQuoteWallet,
+        referrerQuoteWallet: referrerQuoteWallet as any,
       }),
     );
 
@@ -1309,8 +1482,8 @@ export class Market {
         (price *
           Math.pow(10, this._quoteSplTokenDecimals) *
           this._decoded.baseLotSize.toNumber()) /
-        (Math.pow(10, this._baseSplTokenDecimals) *
-          this._decoded.quoteLotSize.toNumber()),
+          (Math.pow(10, this._baseSplTokenDecimals) *
+            this._decoded.quoteLotSize.toNumber()),
       ),
     );
   }
@@ -1374,10 +1547,10 @@ export interface OrderParamsBase<T = Account> {
   orderType?: 'limit' | 'ioc' | 'postOnly';
   clientId?: BN;
   selfTradeBehavior?:
-  | 'decrementTake'
-  | 'cancelProvide'
-  | 'abortTransaction'
-  | undefined;
+    | 'decrementTake'
+    | 'cancelProvide'
+    | 'abortTransaction'
+    | undefined;
   maxTs?: number | null;
 }
 
@@ -1390,7 +1563,9 @@ export interface OrderParamsAccounts<T = Account> {
   programId?: PublicKey;
 }
 
-export interface OrderParams<T = Account> extends OrderParamsBase<T>, OrderParamsAccounts<T> {
+export interface OrderParams<T = Account>
+  extends OrderParamsBase<T>,
+    OrderParamsAccounts<T> {
   replaceIfExists?: boolean;
 }
 
@@ -1619,7 +1794,9 @@ export class Orderbook {
     for (const { key, quantity } of this.slab.items(descending)) {
       const price = getPriceFromKey(key);
       if (levels.length > 0 && levels[levels.length - 1][0].eq(price)) {
-        levels[levels.length - 1][1] = levels[levels.length - 1][1].add(quantity);
+        levels[levels.length - 1][1] = levels[levels.length - 1][1].add(
+          quantity,
+        );
       } else if (levels.length === depth) {
         break;
       } else {

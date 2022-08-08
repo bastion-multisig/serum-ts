@@ -1,5 +1,5 @@
 {
-  "name": "@project-serum/serum",
+  "name": "@bastion-multisig/serum",
   "version": "0.13.65",
   "description": "Library for interacting with the serum dex",
   "license": "MIT",
@@ -56,5 +56,8 @@
     "not dead",
     "not op_mini all",
     "maintained node versions"
-  ]
+  ],
+  "publishConfig": {
+    "access": "public"
+  }
 }
